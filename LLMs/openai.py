@@ -1,4 +1,4 @@
-from openai import OpenAI
+from LLMs.openai import OpenAI
 
 client = OpenAI(api_key="TU_API_KEY")
 
