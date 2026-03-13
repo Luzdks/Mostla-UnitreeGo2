@@ -1,3 +1,78 @@
-import syssys.path.insert(0, '/home/unitree/unitree_sdk2_python')
-from unitree_sdk2py.core.channel import ChannelFactoryfrom unitree_sdk2py.go2.video.video_client import VideoClientfrom http.server import BaseHTTPRequestHandler, HTTPServerimport threading latest_jpeg = b'' lock = threading.Lock()  def fetch():     global latest_jpeg    ChannelFactory().Init(0, 'eth0')     client = VideoClient()     client.SetTimeout(3.0)     client.Init()     while True:         ret, data = client.GetImageSample()         if ret == 0:             with lock:                 latest_jpeg = bytes(data)  class Handler(BaseHTTPRequestHandler):     def log_message(self, *args): pass     def do_GET(self):         self.send_response(200)         self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')         self.end_headers()         while True:             with lock:                 jpg = latest_jpeg            self.wfile.write(b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + jpg + b'\r\n')  threading.Thread(target=fetch, daemon=True).start() print("Stream en: http://10.22.246.248:8888")
-HTTPServer(('0.0.0.0', 8888), Handler).serve_forever()
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+sys.path.insert(0, '/home/unitree/unitree_sdk2_python')
+from unitree_sdk2py.core.channel import ChannelFactory
+from unitree_sdk2py.go2.video.video_client import VideoClient
+
+# --- Estado compartido con doble buffer ---
+latest_jpeg = b''
+lock = threading.Lock()
+frame_event = threading.Event()  # Notifica a los clientes cuando hay frame nuevo
+
+def fetch():
+    global latest_jpeg
+    ChannelFactory().Init(0, 'eth0')
+    client = VideoClient()
+    client.SetTimeout(3.0)
+    client.Init()
+
+    while True:
+        ret, data = client.GetImageSample()
+        if ret == 0:
+            frame = bytes(data)
+            with lock:
+                latest_jpeg = frame
+            frame_event.set()   # Notifica a todos los handlers
+            frame_event.clear()
+        else:
+            time.sleep(0.005)   # Pequeña pausa solo si falla
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args): pass
+
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'keep-alive')
+        self.end_headers()
+
+        last_frame = None
+
+        try:
+            while True:
+                # Espera hasta que haya un frame NUEVO (evita enviar duplicados)
+                frame_event.wait(timeout=0.1)
+
+                with lock:
+                    jpg = latest_jpeg
+
+                # Solo envía si el frame cambió
+                if jpg and jpg is not last_frame:
+                    last_frame = jpg
+                    try:
+                        self.wfile.write(
+                            b'--frame\r\n'
+                            b'Content-Type: image/jpeg\r\n\r\n'
+                            + jpg +
+                            b'\r\n'
+                        )
+                        self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break  # Cliente desconectado
+        except Exception:
+            pass
+
+# --- Servidor con soporte para múltiples clientes simultáneos ---
+from socketserver import ThreadingMixIn
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+
+threading.Thread(target=fetch, daemon=True).start()
+print("Stream en: http://10.22.246.248:8888")
+ThreadedHTTPServer(('0.0.0.0', 8888), Handler).serve_forever()
